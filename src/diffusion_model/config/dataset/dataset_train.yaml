@@ -1,0 +1,8 @@
+dataset:
+  train:
+    name: shapenet
+    dir: dataset_v2_1508
+    json_filename: dataset_train.json  # Ensure this key is included
+    resize_to_hw:
+    - 800
+    - 800
