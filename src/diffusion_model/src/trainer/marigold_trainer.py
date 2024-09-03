@@ -50,7 +50,13 @@ from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
+import wandb
 
+def tensor_to_image(tensor):
+    tensor = tensor.squeeze().cpu().detach().numpy()
+    tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min())  # Normalize to [0, 1]
+    tensor = (tensor * 255).astype(np.uint8)
+    return Image.fromarray(tensor)
 
 class MarigoldTrainer:
     def __init__(
@@ -82,7 +88,7 @@ class MarigoldTrainer:
         self.accumulation_steps: int = accumulation_steps
 
         # Adapt input layers
-        if 8 != self.model.unet.config["in_channels"]:
+        if 12 != self.model.unet.config["in_channels"]:
             self._replace_unet_conv_in()
 
         # Encode empty text prompt
@@ -170,13 +176,13 @@ class MarigoldTrainer:
         # replace the first layer to accept 8 in_channels
         _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
         _bias = self.model.unet.conv_in.bias.clone()  # [320]
-        _weight = _weight.repeat((1, 2, 1, 1))  # Keep selected channel(s)
+        _weight = _weight.repeat((1, 3, 1, 1))  # Keep selected channel(s)
         # half the activation magnitude
-        _weight *= 0.5
+        _weight *= 0.33
         # new conv_in channel
         _n_convin_out_channel = self.model.unet.conv_in.out_channels
         _new_conv_in = Conv2d(
-            8, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
+            12, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
         )
         _new_conv_in.weight = Parameter(_weight)
         _new_conv_in.bias = Parameter(_bias)
@@ -221,10 +227,29 @@ class MarigoldTrainer:
                 # >>> With gradient accumulation >>>
 
                 # Get data
-                rgb_input = batch['input_rgb'].to(device)  # RGB input, shape [B, 3, H, W]
-                depth_input = batch['input_depth'].to(device)
-                
+                rgb = batch['complete_view'].to(device)  # RGB input, shape [B, 3, H, W]
+                depth_input = batch['cuboid_depth'].to(device)
+                depth_output = batch['mesh_depth'].to(device)
 
+
+                rgb_image = rgb[0].cpu().numpy().transpose(1, 2, 0)  # Convert to HWC format
+                depth_input_image = depth_input[0].cpu().numpy()[0]  # Assuming depth is [1, H, W]
+                depth_output_image = depth_output[0].cpu().numpy()[0]  # Assuming depth is [1, H, W]
+
+                # Normalize images for visualization if necessary
+                rgb_image = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min())  # Normalize to [0, 1]
+                depth_input_image = (depth_input_image - depth_input_image.min()) / (depth_input_image.max() - depth_input_image.min())
+                depth_output_image = (depth_output_image - depth_output_image.min()) / (depth_output_image.max() - depth_output_image.min())
+
+                # Log images to W&B
+                wandb.log({
+                    "RGB Image": wandb.Image(rgb_image),
+                    "Depth Input": wandb.Image(depth_input_image),
+                    "Depth Output": wandb.Image(depth_output_image)
+                })
+         
+                #TODO probably have to change this
+                """
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
                     invalid_mask = ~valid_mask_for_latent
@@ -234,16 +259,22 @@ class MarigoldTrainer:
                     valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
                 else:
                     raise NotImplementedError
+                """
 
                 batch_size = rgb.shape[0]
+                logging.info("Batch size")
 
                 with torch.no_grad():
                     # Encode image
                     rgb_latent = self.model.encode_rgb(rgb)  # [B, 4, h, w]
-                    # Encode GT depth
-                    gt_depth_latent = self.encode_depth(
-                        depth_gt_for_latent
+                    input_depth_latent = self.encode_depth(depth_input)
+                    output_depth_latent = self.encode_depth(depth_output)
+                    """
+                    input_depth_latent = self.encode_depth(depth_input)
+                    output_depth_latent = self.encode_depth(
+                        depth_output
                     )  # [B, 4, h, w]
+                    """
 
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
@@ -261,7 +292,7 @@ class MarigoldTrainer:
                         # calculate strength depending on t
                         strength = strength * (timesteps / self.scheduler_timesteps)
                     noise = multi_res_noise_like(
-                        gt_depth_latent,
+                        output_depth_latent,
                         strength=strength,
                         downscale_strategy=self.mr_noise_downscale_strategy,
                         generator=rand_num_generator,
@@ -269,14 +300,14 @@ class MarigoldTrainer:
                     )
                 else:
                     noise = torch.randn(
-                        gt_depth_latent.shape,
+                        output_depth_latent.shape,
                         device=device,
                         generator=rand_num_generator,
                     )  # [B, 4, h, w]
 
                 # Add noise to the latents (diffusion forward process)
                 noisy_latents = self.training_noise_scheduler.add_noise(
-                    gt_depth_latent, noise, timesteps
+                    output_depth_latent, noise, timesteps
                 )  # [B, 4, h, w]
 
                 # Text embedding
@@ -286,7 +317,7 @@ class MarigoldTrainer:
 
                 # Concat rgb and depth latents
                 cat_latents = torch.cat(
-                    [rgb_latent, noisy_latents], dim=1
+                    [rgb_latent, input_depth_latent, noisy_latents], dim=1
                 )  # [B, 8, h, w]
                 cat_latents = cat_latents.float()
 
@@ -299,24 +330,55 @@ class MarigoldTrainer:
 
                 # Get the target for loss depending on the prediction type
                 if "sample" == self.prediction_type:
-                    target = gt_depth_latent
+                    target = output_depth_latent
                 elif "epsilon" == self.prediction_type:
                     target = noise
                 elif "v_prediction" == self.prediction_type:
                     target = self.training_noise_scheduler.get_velocity(
-                        gt_depth_latent, noise, timesteps
+                        output_depth_latent, noise, timesteps
                     )  # [B, 4, h, w]
                 else:
                     raise ValueError(f"Unknown prediction type {self.prediction_type}")
 
                 # Masked latent loss
+                """
                 if self.gt_mask_type is not None:
                     latent_loss = self.loss(
                         model_pred[valid_mask_down].float(),
                         target[valid_mask_down].float(),
                     )
                 else:
-                    latent_loss = self.loss(model_pred.float(), target.float())
+                    """
+
+                encoded_rgb_images = []
+                encoded_depth_input_images = []
+                encoded_depth_output_images = []
+                predicted_images = []
+
+
+                """
+
+                for i in range(rgb_latent.shape[0]):
+                    encoded_rgb_image = tensor_to_image(rgb_latent[i])
+                    encoded_depth_input_image = tensor_to_image(input_depth_latent[i])
+                    encoded_depth_output_image = tensor_to_image(output_depth_latent[i])
+                    predicted_image = tensor_to_image(model_pred[i])
+
+                    # Add images to the lists for logging later
+                    #encoded_rgb_images.append(wandb.Image(encoded_rgb_image, caption=f"Encoded RGB {i}"))
+                    encoded_depth_input_images.append(wandb.Image(encoded_depth_input_image, caption=f"Encoded Depth Input {i}"))
+                    encoded_depth_output_images.append(wandb.Image(encoded_depth_output_image, caption=f"Encoded Depth Output {i}"))
+                    predicted_images.append(wandb.Image(predicted_image, caption=f"Predicted Output {i}"))
+
+                wandb.log({
+                    "Encoded Depth Input Images": encoded_depth_input_images,
+                    "Encoded Depth Output Images": encoded_depth_output_images,
+                    "Predicted Images": predicted_images,
+                })
+
+                """
+       
+                latent_loss = self.loss(model_pred.float(), target.float())
 
                 loss = latent_loss.mean()
 
@@ -394,6 +456,7 @@ class MarigoldTrainer:
 
     @staticmethod
     def stack_depth_images(depth_in):
+        logging.info(depth_in.shape)
         if 4 == len(depth_in.shape):
             stacked = depth_in.repeat(1, 3, 1, 1)
         elif 3 == len(depth_in.shape):
@@ -507,10 +570,12 @@ class MarigoldTrainer:
             start=1,
         ):
             assert 1 == data_loader.batch_size
-            # Read input image
-            rgb_int = batch["rgb_int"].squeeze()  # [3, H, W]
+            
+            # Read input images
+            rgb_int = batch['complete_view'].squeeze()  # [3, H, W]
+            depth_input = batch['cuboid_depth'].squeeze()
             # GT depth
-            depth_raw_ts = batch["depth_raw_linear"].squeeze()
+            depth_raw_ts = batch["mesh_depth"].squeeze()
             depth_raw = depth_raw_ts.numpy()
             depth_raw_ts = depth_raw_ts.to(self.device)
             valid_mask_ts = batch["valid_mask_raw"].squeeze()
@@ -528,6 +593,7 @@ class MarigoldTrainer:
             # Predict depth
             pipe_out: MarigoldDepthOutput = self.model(
                 rgb_int,
+                depth_input,
                 denoising_steps=self.cfg.validation.denoising_steps,
                 ensemble_size=self.cfg.validation.ensemble_size,
                 processing_res=self.cfg.validation.processing_res,

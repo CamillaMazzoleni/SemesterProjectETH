@@ -27,6 +27,7 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
+import json
 
 from marigold import MarigoldPipeline
 
@@ -46,13 +47,15 @@ if "__main__" == __name__:
         default="prs-eth/marigold-lcm-v1-0",
         help="Checkpoint path or hub name.",
     )
-
+    
+    """
     parser.add_argument(
         "--input_rgb_dir",
         type=str,
         required=True,
         help="Path to the input image folder.",
     )
+    """
 
     parser.add_argument(
         "--output_dir", type=str, required=True, help="Output directory."
@@ -125,11 +128,29 @@ if "__main__" == __name__:
         help="Flag of running on Apple Silicon.",
     )
 
+    parser.add_argument(
+    "--json_path",
+    type=str,
+    required=True,
+    help="Path to the dataset JSON file.",
+    )
+
+    parser.add_argument(
+        "--base_dir",
+        type=str,
+        required=True,
+        help="Base directory where the images are stored.",
+    )
+
+    
+
     args = parser.parse_args()
 
+
     checkpoint_path = args.checkpoint
-    input_rgb_dir = args.input_rgb_dir
     output_dir = args.output_dir
+    json_path = args.json_path
+    base_dir = args.base_dir
 
     denoise_steps = args.denoise_steps
     ensemble_size = args.ensemble_size
@@ -179,17 +200,16 @@ if "__main__" == __name__:
     logging.info(f"device = {device}")
 
     # -------------------- Data --------------------
-    rgb_filename_list = glob(os.path.join(input_rgb_dir, "*"))
-    rgb_filename_list = [
-        f for f in rgb_filename_list if os.path.splitext(f)[1].lower() in EXTENSION_LIST
-    ]
-    rgb_filename_list = sorted(rgb_filename_list)
-    n_images = len(rgb_filename_list)
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    n_images = len(data)
     if n_images > 0:
-        logging.info(f"Found {n_images} images")
+        logging.info(f"Found {n_images} images in JSON file")
     else:
-        logging.error(f"No image found in '{input_rgb_dir}'")
+        logging.error(f"No images found in JSON file '{json_path}'")
         exit(1)
+
 
     # -------------------- Model --------------------
     if half_precision:
@@ -230,9 +250,14 @@ if "__main__" == __name__:
     with torch.no_grad():
         os.makedirs(output_dir, exist_ok=True)
 
-        for rgb_path in tqdm(rgb_filename_list, desc="Estimating depth", leave=True):
-            # Read input image
-            input_image = Image.open(rgb_path)
+        for item in tqdm(data, desc="Estimating depth", leave=True):
+            # Construct full paths for images
+            rgb_path = os.path.join(base_dir, item['complete_view'])
+            depth_path = os.path.join(base_dir, item['cuboid_depth'])
+
+            # Read input images
+            input_rgb_image = Image.open(rgb_path)
+            input_depth_image = Image.open(depth_path)
 
             # Random number generator
             if seed is None:
@@ -243,7 +268,8 @@ if "__main__" == __name__:
 
             # Predict depth
             pipe_out = pipe(
-                input_image,
+                input_image_rgb=input_rgb_image,
+                input_image_depth=input_depth_image,
                 denoising_steps=denoise_steps,
                 ensemble_size=ensemble_size,
                 processing_res=processing_res,
