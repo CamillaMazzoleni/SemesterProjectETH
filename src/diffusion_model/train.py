@@ -103,6 +103,9 @@ if "__main__" == __name__:
         help="Add datetime to the output folder name",
     )
 
+    
+
+
     args = parser.parse_args()
     resume_run = args.resume_run
     output_dir = args.output_dir
