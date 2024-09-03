@@ -335,3 +335,5 @@ results/
 models/
 src/diffusion_model/output/
 src/diffusion_model/sbatch_traindiff.sh
+
+.vscode/
