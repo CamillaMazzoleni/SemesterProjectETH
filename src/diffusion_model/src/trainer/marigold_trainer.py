@@ -39,6 +39,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from PIL import Image
+from scipy.ndimage import binary_dilation
 
 from marigold.marigold_pipeline import MarigoldPipeline, MarigoldDepthOutput
 from src.util import metric
@@ -52,11 +53,22 @@ from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
 import wandb
 
+import open3d as o3d
+
+import numpy as np
+import torch
+torch.cuda.empty_cache()
+
+
 def tensor_to_image(tensor):
     tensor = tensor.squeeze().cpu().detach().numpy()
-    tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min())  # Normalize to [0, 1]
-    tensor = (tensor * 255).astype(np.uint8)
-    return Image.fromarray(tensor)
+    #tensor = (tensor + 1.0) / 2.0
+    if tensor.ndim == 3 and tensor.shape[0] == 3:
+        tensor = np.transpose(tensor, (1, 2, 0))
+    else:
+        tensor = tensor[0]
+    return tensor
+
 
 class MarigoldTrainer:
     def __init__(
@@ -73,6 +85,7 @@ class MarigoldTrainer:
         val_dataloaders: List[DataLoader] = None,
         vis_dataloaders: List[DataLoader] = None,
     ):
+        self.depth_mask = False
         self.cfg: OmegaConf = cfg
         self.model: MarigoldPipeline = model
         self.device = device
@@ -90,6 +103,8 @@ class MarigoldTrainer:
         # Adapt input layers
         if 12 != self.model.unet.config["in_channels"]:
             self._replace_unet_conv_in()
+
+        logging.info(self.val_loaders)
 
         # Encode empty text prompt
         self.model.encode_empty_text()
@@ -123,9 +138,11 @@ class MarigoldTrainer:
                 base_ckpt_dir,
                 cfg.trainer.training_noise_scheduler.pretrained_path,
                 "scheduler",
+                
             )
         )
         self.prediction_type = self.training_noise_scheduler.config.prediction_type
+        print(self.prediction_type)
         assert (
             self.prediction_type == self.model.scheduler.config.prediction_type
         ), "Different prediction types"
@@ -192,10 +209,36 @@ class MarigoldTrainer:
         self.model.unet.config["in_channels"] = 8
         logging.info("Unet config is updated")
         return
+    """
+    def _dilate_and_downsample_mask(self, invalid_mask):
+        # Step 1: Apply dilation to each 2D depth slice
+        print("Original mask shape:", invalid_mask.shape)  # Print original mask shape
+
+        dilated_valid_mask_list = []
+        for i in range(invalid_mask.shape[0]):  # Iterate over the batch dimension
+            single_mask = invalid_mask[i, 0].cpu().numpy()  # Get [H, W] mask
+            dilated_single_mask = binary_dilation(single_mask, structure=np.ones((3, 3)))
+            dilated_valid_mask_list.append(torch.tensor(dilated_single_mask, device=self.device))
+        
+        dilated_valid_mask = torch.stack(dilated_valid_mask_list).unsqueeze(1)
+        print("After dilation, mask shape:", dilated_valid_mask.shape)  # Print shape after dilation
+        
+        # Step 2: Downsample the mask to match latent tensor size
+        dilated_valid_mask = ~torch.max_pool2d(dilated_valid_mask.float(), 8, 8).bool()
+        print("After downsampling, mask shape:", dilated_valid_mask.shape)  # Print shape after downsampling
+        
+        # Repeat mask to match latent channels
+        dilated_valid_mask = dilated_valid_mask.repeat((1, 4, 1, 1))
+        print("After repeating to match latent channels, mask shape:", dilated_valid_mask.shape)  # Print shape after repeating
+
+        return dilated_valid_mask
+    """
+
 
     def train(self, t_end=None):
         logging.info("Start training")
-
+        logging.info(f"Loss type: {self.prediction_type}")
+        
         device = self.device
         self.model.to(device)
 
@@ -207,13 +250,13 @@ class MarigoldTrainer:
 
         self.train_metrics.reset()
         accumulated_step = 0
-
         for epoch in range(self.epoch, self.max_epoch + 1):
             self.epoch = epoch
             logging.debug(f"epoch: {self.epoch}")
 
             # Skip previous batches when resume
             for batch in skip_first_batches(self.train_loader, self.n_batch_in_epoch):
+
                 self.model.unet.train()
 
                 # globally consistent random generators
@@ -227,20 +270,88 @@ class MarigoldTrainer:
                 # >>> With gradient accumulation >>>
 
                 # Get data
-                rgb = batch['complete_view'].to(device)  # RGB input, shape [B, 3, H, W]
-                depth_input = batch['cuboid_depth'].to(device)
-                depth_output = batch['mesh_depth'].to(device)
+                rgb = batch['complete_view']['rgb_norm'].to(device)  # RGB input, shape [B, 3, H, W]
+                depth_input = batch['cuboid_depth'][self.gt_depth_type].to(device)
+                depth_output = batch['mesh_depth'][self.gt_depth_type].to(device)
+
+                #depth_input = 1 - depth_input
+                #depth_output = 1 - depth_output
+                # Create valid masks for both depth inputs and outputs
+                #valid_mask_raw = batch["valid_mask_raw"].to(device)  # From ShapeNetDataset
+                #valid_mask_filled = batch["valid_mask_filled"].to(device)
 
 
-                rgb_image = rgb[0].cpu().numpy().transpose(1, 2, 0)  # Convert to HWC format
-                depth_input_image = depth_input[0].cpu().numpy()[0]  # Assuming depth is [1, H, W]
-                depth_output_image = depth_output[0].cpu().numpy()[0]  # Assuming depth is [1, H, W]
+                if self.gt_mask_type is not None:
+                    valid_mask_for_latent = batch[self.gt_mask_type].to(device)
+                    invalid_mask = ~valid_mask_for_latent
+                    valid_mask_down = ~torch.max_pool2d(
+                        invalid_mask.float(), 8, 8
+                    ).bool()
+                    valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
+                else:
+                    raise NotImplementedError
 
-                # Normalize images for visualization if necessary
-                rgb_image = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min())  # Normalize to [0, 1]
+                # Apply depth masks to input and output depths
+                """
+                if self.depth_mask:
+                    # Create an invalid mask (invert valid mask)
+                    invalid_mask = ~valid_mask_raw
+                   
+                    dilated_valid_mask = self._dilate_and_downsample_mask(invalid_mask)
+
+                    # Apply the mask to the depth latents
+                    depth_input = depth_input[dilated_valid_mask]
+                    depth_output = depth_output[dilated_valid_mask]
+                    # Step 3: Check the shapes and values of the mask to ensure correctness
+                    print(f"Depth Output Shape: {depth_output.shape}")
+                    print(f"Valid Mask Shape: {valid_mask_raw.shape}")
+                    print(f"Dilated Mask Shape: {dilated_valid_mask_raw.shape}")
+                    print(f"Valid Mask (before dilation) sample: {valid_mask[0, 0, :5, :5]}")
+                    print(f"Dilated Mask sample: {dilated_valid_mask[0, 0, :5, :5]}")
+                
+
+                
+                if self.depth_mask:
+                    invalid_mask = ~valid_mask_for_latent  # Invert the valid mask
+                    
+                    # Step 2: Apply dilation to each 2D depth slice
+                    dilated_valid_mask_list = []
+                    for i in range(invalid_mask.shape[0]):  # Iterate over the batch dimension
+                        # Extract each mask for dilation
+                        single_mask = invalid_mask[i, 0].cpu().numpy()  # Get [H, W] mask
+                        
+                        # Apply binary dilation to the 2D mask
+                        dilated_single_mask = binary_dilation(single_mask, structure=np.ones((3, 3)))
+                        
+                        # Convert back to tensor and append to the list
+                        dilated_valid_mask_list.append(torch.tensor(dilated_single_mask, device=device))
+
+                    # Stack the dilated masks back into a 4D tensor [B, 1, H, W]
+                    dilated_valid_mask = torch.stack(dilated_valid_mask_list).unsqueeze(1)
+                    
+                    # Step 3: Downsample the dilated mask to match the latent tensor size
+                    dilated_valid_mask = ~torch.max_pool2d(
+                        dilated_valid_mask.float(), 8, 8
+                    ).bool()  # Downsample with kernel and stride of 8
+
+                    # Step 4: Repeat the downsampled mask to match the number of channels (4 in your case)
+                    dilated_valid_mask = dilated_valid_mask.repeat((1, 4, 1, 1))
+
+                    # Step 3: Check the shapes and values of the mask to ensure correctness
+                    print(f"Depth Output Shape: {depth_output.shape}")
+                    print(f"Valid Mask Shape: {valid_mask.shape}")
+                    print(f"Dilated Mask Shape: {dilated_valid_mask.shape}")
+                    print(f"Valid Mask (before dilation) sample: {valid_mask[0, 0, :5, :5]}")
+                    print(f"Dilated Mask sample: {dilated_valid_mask[0, 0, :5, :5]}")
+                """
+                
+                rgb_image = rgb[0].cpu().numpy().transpose(1, 2, 0)
+                depth_input_image = depth_input[0].cpu().numpy()[0]  
+                depth_output_image = depth_output[0].cpu().numpy()[0]  
                 depth_input_image = (depth_input_image - depth_input_image.min()) / (depth_input_image.max() - depth_input_image.min())
                 depth_output_image = (depth_output_image - depth_output_image.min()) / (depth_output_image.max() - depth_output_image.min())
-
+                
+                
                 # Log images to W&B
                 wandb.log({
                     "RGB Image": wandb.Image(rgb_image),
@@ -262,19 +373,82 @@ class MarigoldTrainer:
                 """
 
                 batch_size = rgb.shape[0]
-                logging.info("Batch size")
+                
 
                 with torch.no_grad():
                     # Encode image
                     rgb_latent = self.model.encode_rgb(rgb)  # [B, 4, h, w]
                     input_depth_latent = self.encode_depth(depth_input)
                     output_depth_latent = self.encode_depth(depth_output)
+
+
                     """
-                    input_depth_latent = self.encode_depth(depth_input)
-                    output_depth_latent = self.encode_depth(
-                        depth_output
-                    )  # [B, 4, h, w]
+
+                    encode_try = depth_output.squeeze()
+                    encode_try = encode_try.cpu().numpy()
+                    img_name = "try_encode.png"
+                    encode_try = (encode_try + 1.0) / 2.0
+                    depth_to_save = (encode_try * 65535.0).astype(np.uint16)
+                    Image.fromarray(depth_to_save).save(img_name, mode="I;16")
                     """
+
+                    # Decode the depth latent
+                    input_try = self.model.decode_depth(input_depth_latent)
+
+                    # Squeeze and convert to numpy
+                    input_try = input_try.squeeze().cpu().numpy()
+
+                    # Print min and max values after squeezing
+                    print(f"After squeezing: min={input_try.min()}, max={input_try.max()}")
+
+                    # Normalize to range [0, 1]
+                    input_try = (input_try + 1.0) / 2.0
+
+                    # Print min and max values after normalization
+                    print(f"After normalization: min={input_try.min()}, max={input_try.max()}")
+
+                    # 1. Multiply by 1000 and clip
+                    input_1 = input_try * 1000  # Convert to millimeters
+                    input_1_clipped = np.clip(input_1, 0, 65535).astype(np.uint16)
+                    img_name_1 = "try_decode_input_mult_clip.png"
+                    new_depth_image_1 = o3d.geometry.Image(input_1_clipped)
+                    o3d.io.write_image(img_name_1, new_depth_image_1)
+
+                    # 2. Multiply by 1000 and don't clip
+                    input_2 = input_try * 1000  # Convert to millimeters without clipping
+                    img_name_2 = "try_decode_input_mult_noclip.png"
+                    new_depth_image_2 = o3d.geometry.Image(input_2.astype(np.uint16))  # This might overflow
+                    o3d.io.write_image(img_name_2, new_depth_image_2)
+
+                    # 3. No multiplication, but clip
+                    input_3_clipped = np.clip(input_try, 0, 65535).astype(np.uint16)  # No multiplication, clip values
+                    img_name_3 = "try_decode_input_nomult_clip.png"
+                    new_depth_image_3 = o3d.geometry.Image(input_3_clipped)
+                    o3d.io.write_image(img_name_3, new_depth_image_3)
+
+                    # 4. No multiplication and no clipping
+                    input_4 = input_try  # No multiplication and no clipping
+                    img_name_4 = "try_decode_input_nomult_noclip.png"
+                    new_depth_image_4 = o3d.geometry.Image(input_4.astype(np.uint16))  # This might cause range issues
+                    o3d.io.write_image(img_name_4, new_depth_image_4)
+
+                    print("All four depth images have been saved.")
+
+                    """
+                    decode_try = self.model.decode_depth(output_depth_latent)
+                    decode_try = torch.clip(decode_try, -1.0, 1.0)
+                    decode_try = (decode_try + 1.0) / 2.0
+                    decode_try = decode_try.squeeze()
+                    decode_try = decode_try.cpu().numpy()
+                    img_name = "try_decode.png"
+                    depth_to_save = (decode_try * 65535.0).astype(np.uint16)
+                    Image.fromarray(depth_to_save).save(img_name, mode="I;16")
+                    """
+
+                    if self.depth_mask:
+                        input_depth_latent = input_depth_latent[dilated_valid_mask]
+                        output_depth_latent = output_depth_latent[dilated_valid_mask]
+                    
 
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
@@ -337,26 +511,21 @@ class MarigoldTrainer:
                     target = self.training_noise_scheduler.get_velocity(
                         output_depth_latent, noise, timesteps
                     )  # [B, 4, h, w]
+                elif "difference" == self.prediction_type:
+                    #target = input_depth_latent + model_pred
+                    target = output_depth_latent - input_depth_latent
+
                 else:
                     raise ValueError(f"Unknown prediction type {self.prediction_type}")
 
                 # Masked latent loss
-                """
-                if self.gt_mask_type is not None:
-                    latent_loss = self.loss(
-                        model_pred[valid_mask_down].float(),
-                        target[valid_mask_down].float(),
-                    )
-                else:
-                    """
+                
+                    
 
                 encoded_rgb_images = []
                 encoded_depth_input_images = []
                 encoded_depth_output_images = []
                 predicted_images = []
-
-
-                """
 
                 for i in range(rgb_latent.shape[0]):
                     encoded_rgb_image = tensor_to_image(rgb_latent[i])
@@ -365,21 +534,27 @@ class MarigoldTrainer:
                     predicted_image = tensor_to_image(model_pred[i])
 
                     # Add images to the lists for logging later
-                    #encoded_rgb_images.append(wandb.Image(encoded_rgb_image, caption=f"Encoded RGB {i}"))
+                    encoded_rgb_images.append(wandb.Image(encoded_rgb_image, caption=f"Encoded RGB {i}"))
                     encoded_depth_input_images.append(wandb.Image(encoded_depth_input_image, caption=f"Encoded Depth Input {i}"))
                     encoded_depth_output_images.append(wandb.Image(encoded_depth_output_image, caption=f"Encoded Depth Output {i}"))
                     predicted_images.append(wandb.Image(predicted_image, caption=f"Predicted Output {i}"))
 
                 wandb.log({
+                    "Encoded RGB": encoded_rgb_images,
                     "Encoded Depth Input Images": encoded_depth_input_images,
                     "Encoded Depth Output Images": encoded_depth_output_images,
                     "Predicted Images": predicted_images,
                 })
 
-                """
-       
-                latent_loss = self.loss(model_pred.float(), target.float())
-
+                # Masked latent loss
+                if self.gt_mask_type is not None:
+                    latent_loss = self.loss(
+                        model_pred[valid_mask_down].float(),
+                        target[valid_mask_down].float(),
+                    )
+                else:
+                    latent_loss = self.loss(model_pred.float(), target.float())
+                
                 loss = latent_loss.mean()
 
                 self.train_metrics.update("loss", loss.item())
@@ -456,7 +631,6 @@ class MarigoldTrainer:
 
     @staticmethod
     def stack_depth_images(depth_in):
-        logging.info(depth_in.shape)
         if 4 == len(depth_in.shape):
             stacked = depth_in.repeat(1, 3, 1, 1)
         elif 3 == len(depth_in.shape):
@@ -495,8 +669,12 @@ class MarigoldTrainer:
             self.visualize()
 
     def validate(self):
+        logging.info("validation phase")
         for i, val_loader in enumerate(self.val_loaders):
-            val_dataset_name = val_loader.dataset.disp_name
+            #val_dataset_name = val_loader.dataset.dispname
+            val_dataset_name ="shapenet"
+            val_loader_filename = "single_image.json"
+
             val_metric_dic = self.validate_single_dataset(
                 data_loader=val_loader, metric_tracker=self.val_metrics
             )
@@ -511,7 +689,7 @@ class MarigoldTrainer:
             eval_text = eval_dic_to_text(
                 val_metrics=val_metric_dic,
                 dataset_name=val_dataset_name,
-                sample_list_path=val_loader.dataset.filename_ls_path,
+                sample_list_path=val_loader_filename,
             )
             _save_to = os.path.join(
                 self.out_dir_eval,
@@ -539,12 +717,15 @@ class MarigoldTrainer:
                     )
 
     def visualize(self):
+        logging.info("visualization phase")
         for val_loader in self.vis_loaders:
-            vis_dataset_name = val_loader.dataset.disp_name
+            #vis_dataset_name = val_loader.dataset.dispname
+            vis_dataset_name = "shapenet"
             vis_out_dir = os.path.join(
                 self.out_dir_vis, self._get_backup_ckpt_name(), vis_dataset_name
             )
             os.makedirs(vis_out_dir, exist_ok=True)
+            print(f"saving at {vis_out_dir}")
             _ = self.validate_single_dataset(
                 data_loader=val_loader,
                 metric_tracker=self.val_metrics,
@@ -566,22 +747,22 @@ class MarigoldTrainer:
         val_seed_ls = generate_seed_sequence(val_init_seed, len(data_loader))
 
         for i, batch in enumerate(
-            tqdm(data_loader, desc=f"evaluating on {data_loader.dataset.disp_name}"),
+            tqdm(data_loader, desc=f"evaluating on dataset"),
             start=1,
         ):
             assert 1 == data_loader.batch_size
             
             # Read input images
-            rgb_int = batch['complete_view'].squeeze()  # [3, H, W]
-            depth_input = batch['cuboid_depth'].squeeze()
-            # GT depth
-            depth_raw_ts = batch["mesh_depth"].squeeze()
+            rgb_int = batch['complete_view']['rgb_int']
+            depth_input = batch['cuboid_depth']['depth_raw_linear'].squeeze() #tocheck
+            depth_raw_ts = batch["mesh_depth"]['depth_raw_linear'].squeeze() #tocheck
             depth_raw = depth_raw_ts.numpy()
             depth_raw_ts = depth_raw_ts.to(self.device)
             valid_mask_ts = batch["valid_mask_raw"].squeeze()
+            print(valid_mask_ts.shape)
             valid_mask = valid_mask_ts.numpy()
             valid_mask_ts = valid_mask_ts.to(self.device)
-
+            
             # Random number generator
             seed = val_seed_ls.pop()
             if seed is None:
@@ -624,6 +805,8 @@ class MarigoldTrainer:
                 a_min=data_loader.dataset.min_depth,
                 a_max=data_loader.dataset.max_depth,
             )
+            print(depth_pred.min())
+            print(depth_pred.max())
 
             # clip to d > 0 for evaluation
             depth_pred = np.clip(depth_pred, a_min=1e-6, a_max=None)
@@ -640,7 +823,7 @@ class MarigoldTrainer:
 
             # Save as 16-bit uint png
             if save_to_dir is not None:
-                img_name = batch["rgb_relative_path"][0].replace("/", "_")
+                img_name = batch["path_to_image"][0].replace("/", "_")
                 png_save_path = os.path.join(save_to_dir, f"{img_name}.png")
                 depth_to_save = (pipe_out.depth_np * 65535.0).astype(np.uint16)
                 Image.fromarray(depth_to_save).save(png_save_path, mode="I;16")

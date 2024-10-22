@@ -44,7 +44,6 @@ class DatasetMode(Enum):
 
 class DepthFileNameMode(Enum):
     """Prediction file naming modes"""
-
     id = 1  # id.png
     rgb_id = 2  # rgb_id.png
     i_d_rgb = 3  # i_d_1_rgb.png
@@ -67,7 +66,7 @@ class BaseDepthDataset(Dataset):
         min_depth: float,
         max_depth: float,
         has_filled_depth: bool,
-        name_mode: DepthFileNameMode,
+        name_mode: DepthFileNameMode = 1,
         depth_transform: Union[DepthNormalizerBase, None] = None,
         augmentation_args: dict = None,
         resize_to_hw=None,
@@ -200,10 +199,12 @@ class BaseDepthDataset(Dataset):
             image_to_read = os.path.join(self.dataset_dir, img_rel_path)
         image = Image.open(image_to_read)  # [H, W, rgb]
         image = np.asarray(image)
+        print(image.shape)
         return image
 
     def _read_rgb_file(self, rel_path) -> np.ndarray:
         rgb = self._read_image(rel_path)
+
         rgb = np.transpose(rgb, (2, 0, 1)).astype(int)  # [rgb, H, W]
         return rgb
 
@@ -282,3 +283,4 @@ def get_pred_name(rgb_basename, name_mode, suffix=".png"):
     pred_basename = os.path.splitext(pred_basename)[0] + suffix
 
     return pred_basename
+

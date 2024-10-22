@@ -38,8 +38,6 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import pil_to_tensor, resize
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
-import os
-import matplotlib.pyplot as plt
 
 from .util.batchsize import find_batch_size
 from .util.ensemble import ensemble_depth
@@ -187,7 +185,7 @@ class MarigoldPipeline(DiffusionPipeline):
                 for Marigold-LCM models.
             ensemble_size (`int`, *optional*, defaults to `10`):
                 Number of predictions to be ensembled.
-            processing_res (`int`, *optional*, defaults to `None`):
+             (`int`, *optional*, defaults to `None`):
                 Effective processing resolution. When set to `0`, processes at the original image resolution. This
                 produces crisper predictions, but may also lead to the overall loss of global context. The default
                 value `None` resolves to the optimal value from the model config.
@@ -235,10 +233,12 @@ class MarigoldPipeline(DiffusionPipeline):
         
 
         # ----------------- Image Preprocess -----------------
+
+        """
         # Convert RGB image to torch tensor
         if isinstance(input_image_rgb, Image.Image):
-            input_image_rgb = input_image_rgb.convert("RGB")
-            input_image_rgb = input_image_rgb.resize((200,200))
+            #input_image_rgb = input_image_rgb.convert("RGB")
+            rgb = input_image_rgb.resize((800,800))
             rgb = pil_to_tensor(input_image_rgb).unsqueeze(0)  # [1, rgb, H, W]
         elif isinstance(input_image_rgb, torch.Tensor):
             rgb = input_image_rgb
@@ -247,45 +247,115 @@ class MarigoldPipeline(DiffusionPipeline):
 
         # Convert Depth image to torch tensor
         if isinstance(input_image_depth, Image.Image):
-            input_image_depth = input_image_depth.resize((200,200)).convert("L")
+            depth = depth.resize((800,800))
             depth = pil_to_tensor(input_image_depth).unsqueeze(0)  # [1, depth, H, W]
         elif isinstance(input_image_depth, torch.Tensor):
             depth = input_image_depth
         else:
             raise TypeError(f"Unknown input type for Depth image: {type(input_image_depth)}")
 
-
-        print("Depth Shape: ", depth.shape)
-
         # Ensure both images have the same dimensions
         if rgb.shape[-2:] != depth.shape[-2:]:
             raise ValueError("RGB and Depth images must have the same dimensions.")
 
         # Resize images if needed
-        """
+    
         if processing_res > 0:
             rgb = resize_max_res(rgb, max_edge_resolution=processing_res, resample_method=resample_method)
             depth = resize_max_res(depth, max_edge_resolution=processing_res, resample_method=resample_method)
-        """
+       
 
         # Normalize the RGB values
-        rgb_norm: torch.Tensor = rgb / 255.0 * 2.0 - 1.0  # [0, 255] -> [-1, 1]
+        print(f"RGB min: {rgb.min()}, RGB max: {rgb.max()}")
+        min_rgb = rgb.min()
+        max_rgb = rgb.max()
+        rgb_norm: torch.Tensor = rgb  # [0, 255] -> [-1, 1]
+        min_rgb_norm = rgb_norm.min()
+        max_rgb_norm = rgb_norm.max()
+        rgb_norm = rgb_norm.to(self.dtype) 
+        print(f"RGB min: {rgb_norm.min()}, RGB max: {rgb_norm.max()}")
+        assert rgb_norm.min() >= -1 and rgb_norm.max() <= 1
+
+        depth = (depth + 1) / 2  # Normalize to [0, 1]
+        depth = 1 - depth
+        depth = depth.repeat(1, 3, 1, 1)
+        depth_norm: torch.Tensor = depth * 2.0 - 1 # [0, 255] -> [-1, 1]
+        depth_norm = depth_norm.to(self.dtype)
+        min_depth_norm = depth_norm.min()
+        max_depth_norm = depth_norm.max()
+        assert depth_norm.min() >= -1 and depth_norm.max() <= 1
+
+        print(f"RGB Norm Shape: {rgb_norm.shape}")
+        print(f"Depth Norm Shape: {depth_norm.shape}")
+        """
+        if isinstance(input_image_rgb, Image.Image):
+            input_image_rgb = input_image_rgb.convert("RGB")
+            # convert to torch tensor [H, W, rgb] -> [rgb, H, W]
+            input_image_rgb = input_image_rgb.resize((800,800))
+            rgb = pil_to_tensor(input_image_rgb)
+            rgb = rgb.unsqueeze(0)  # [1, rgb, H, W]
+        elif isinstance(input_image_rgb, torch.Tensor):
+            rgb = input_image_rgb
+        else:
+            raise TypeError(f"Unknown input type: {type(input_image_rgb) = }")
+        input_size = rgb.shape
+        assert (
+            4 == rgb.dim() and 3 == input_size[-3]
+        ), f"Wrong input shape {input_size}, expected [1, rgb, H, W]"
+        """
+        if processing_res > 0:
+            rgb = resize_max_res(
+                rgb,
+                max_edge_resolution=processing_res,
+                resample_method=resample_method,
+            )
+        """
+        # Normalize rgb values
+        rgb_norm: torch.Tensor = rgb / 255.0 * 2.0 - 1.0  #  [0, 255] -> [-1, 1]
         rgb_norm = rgb_norm.to(self.dtype)
         assert rgb_norm.min() >= -1.0 and rgb_norm.max() <= 1.0
 
-        # Normalize the Depth values (if needed, depending on depth format)
-        depth_norm: torch.Tensor = depth / 255.0 * 2.0 - 1.0  # [0, 255] -> [-1, 1]
+        # Convert Depth image to torch tensor
+        if isinstance(input_image_depth, Image.Image):
+            input_image_depth = input_image_depth.resize((800,800))
+            depth = pil_to_tensor(input_image_depth)
+            depth = depth.unsqueeze(0)
+        elif isinstance(input_image_depth, torch.Tensor):
+            depth = input_image_depth
+        else:
+            raise TypeError(f"Unknown input type for Depth image: {type(input_image_depth)}")
+        
+        """
+        if processing_res > 0:
+            depth = resize_max_res(
+                depth,
+                max_edge_resolution=processing_res,
+                resample_method=resample_method,
+            )
+        """
+       
+        depth = depth / 255 #might be wrong
+        depth = 1 - depth
+        depth = depth.repeat(1, 3, 1, 1)
+        depth_norm: torch.Tensor = depth * 2.0 - 1 # [0, 255] -> [-1, 1]
         depth_norm = depth_norm.to(self.dtype)
-        assert depth_norm.min() >= -1.0 and depth_norm.max() <= 1.0
+        min_depth_norm = depth_norm.min()
+        max_depth_norm = depth_norm.max()
+        assert depth_norm.min() >= -1 and depth_norm.max() <= 1
 
-
+        print(f"RGB Norm Shape: {rgb_norm.shape}")
+        print(f"Depth Norm Shape: {depth_norm.shape}")
 
         # ----------------- Predicting cubemap -----------------
+
+        rgb_norm = rgb_norm.unsqueeze(0) if rgb_norm.dim() == 3 else rgb_norm
+        depth_norm = depth_norm.unsqueeze(0) if depth_norm.dim() == 3 else depth_norm
+
 
         # Expand the input images to create batched data
         duplicated_rgb = rgb_norm.expand(ensemble_size, -1, -1, -1)
         duplicated_depth = depth_norm.expand(ensemble_size, -1, -1, -1)
-
+        
         # Create the combined dataset
         paired_dataset = PairedDataset(duplicated_rgb, duplicated_depth)
 
@@ -314,7 +384,7 @@ class MarigoldPipeline(DiffusionPipeline):
             )
             depth_pred_ls.append(depth_pred_raw.detach())
 
-        depth_preds = torch.cat(depth_pred_ls, dim=0)
+        depth_preds = torch.concat(depth_pred_ls, dim=0)
         torch.cuda.empty_cache()
 
 
@@ -330,13 +400,12 @@ class MarigoldPipeline(DiffusionPipeline):
         else:
             depth_pred = depth_preds
             pred_uncert = None
-        width, height = input_image_rgb.size
-        print("Width: ", width)
+
         # Resize back to original resolution
         if match_input_res:
             depth_pred = resize(
                 depth_pred,
-                (width, height),
+                input_size[-2:],
                 interpolation=resample_method,
                 antialias=True,
             )
@@ -349,6 +418,9 @@ class MarigoldPipeline(DiffusionPipeline):
 
         # Clip output range
         depth_pred = depth_pred.clip(0, 1)
+        #pring some info
+        print(f"Depth min: {depth_pred.min()}, Depth max: {depth_pred.max()}")
+        print(f"Depth Shape: {depth_pred.shape}")
 
         # Colorize
         if color_map is not None:
@@ -404,18 +476,14 @@ class MarigoldPipeline(DiffusionPipeline):
         self.empty_text_embed = self.text_encoder(text_input_ids)[0].to(self.dtype)
 
     @torch.no_grad()
-    
-
     def single_infer(
-            self,
-            rgb_input: torch.Tensor,
-            depth_input: torch.Tensor,
-            num_inference_steps: int,
-            generator: Union[torch.Generator, None],
-            show_pbar: bool,
-            save_plots: bool = True,
-            plot_dir: str = "./plots"
-        ) -> torch.Tensor:
+        self,
+        rgb_input: torch.Tensor,
+        depth_input: torch.Tensor,
+        num_inference_steps: int,
+        generator: Union[torch.Generator, None],
+        show_pbar: bool,
+    ) -> torch.Tensor:
         """
         Perform an individual depth prediction without ensembling.
 
@@ -423,15 +491,11 @@ class MarigoldPipeline(DiffusionPipeline):
             rgb_in (`torch.Tensor`):
                 Input RGB image.
             num_inference_steps (`int`):
-                Number of diffusion denoising steps (DDIM) during inference.
+                Number of diffusion denoisign steps (DDIM) during inference.
             show_pbar (`bool`):
                 Display a progress bar of diffusion denoising.
             generator (`torch.Generator`)
                 Random generator for initial noise generation.
-            save_plots (`bool`, optional):
-                Whether to save plots of the original images and their encodings.
-            plot_dir (`str`, optional):
-                Directory to save plots. Defaults to "./plots".
         Returns:
             `torch.Tensor`: Predicted depth map.
         """
@@ -447,35 +511,28 @@ class MarigoldPipeline(DiffusionPipeline):
         
         # Encode RGB and Depth inputs
         rgb_latent = self.encode_rgb(rgb_input)  # Encode the RGB input
-        depth_latent = self.encode_depth(depth_input)  # Encode the Depth input
-
-        print("RGB Latent Shape: ", rgb_latent.shape)
-        print("Depth Latent Shape: ", depth_latent.shape)
-
-        # Save plots if requested
-        if save_plots:
-            self.save_image_and_encoding(rgb_input, rgb_latent, plot_dir, "rgb")
-            self.save_image_and_encoding(depth_input, depth_latent, plot_dir, "depth")
-
+        depth_latent_input = self.encode_rgb(depth_input)  # Encode the Depth input
+    
         # Initial depth map (noise)
-        depth_latent_noise = torch.randn(
-            depth_latent.shape,
+        depth_latent_output = torch.randn(
+            depth_latent_input.shape,
             device=device,
             dtype=self.dtype,
             generator=generator,
         )  # [B, channels, H, W]
 
+        combined_latent = torch.cat([rgb_latent, depth_latent_input], dim=1)  # [B, channels, H, W]
+
         # Batched empty text embedding
         if self.empty_text_embed is None:
             self.encode_empty_text()
         batch_empty_text_embed = self.empty_text_embed.repeat(
-            (depth_latent.shape[0], 1, 1)
-        ).to(device)  # [B, 77, 1024]
-
+            (combined_latent.shape[0], 1, 1)
+        ).to(device)  
+        """
         # Denoising loop
         for i, t in enumerate(tqdm(timesteps, desc="Diffusion denoising", leave=False) if show_pbar else timesteps):
             # Predict the noise residual
-            combined_latent = torch.cat([rgb_latent, depth_latent, depth_latent_noise], dim=1)
             noise_pred = self.unet(
                 combined_latent, t, encoder_hidden_states=batch_empty_text_embed
             ).sample  # [B, channels, H, W]
@@ -493,45 +550,48 @@ class MarigoldPipeline(DiffusionPipeline):
         depth_final = (depth_final + 1.0) / 2.0
 
         return depth_final
-
-    def save_image_and_encoding(self, image, encoding, plot_dir, name):
         """
-        Save the original image and its encoding as plots.
+        if show_pbar:
+            iterable = tqdm(
+                enumerate(timesteps),
+                total=len(timesteps),
+                leave=False,
+                desc=" " * 4 + "Diffusion denoising",
+            )
+        else:
+            iterable = enumerate(timesteps)
 
-        Args:
-            image (torch.Tensor): The original input image.
-            encoding (torch.Tensor): The encoded representation of the image.
-            plot_dir (str): Directory to save the plots.
-            name (str): Name prefix for the saved files.
-        """
+        for i, t in iterable:
+            unet_input = torch.cat(
+                [rgb_latent, depth_latent_input, depth_latent_output], dim=1
+            )  # this order is important
 
-        if not os.path.exists(plot_dir):
-            os.makedirs(plot_dir)
+            # predict the noise residual
+            noise_pred = self.unet(
+                unet_input, t, encoder_hidden_states=batch_empty_text_embed
+            ).sample  # [B, 4, h, w]
 
-        # Convert tensors to numpy arrays for plotting
-        image_np = image.squeeze().detach().cpu().numpy()
-        encoding_np = encoding.squeeze().detach().cpu().numpy()
+            # compute the previous noisy sample x_t -> x_t-1
+            depth_latent_output = self.scheduler.step(
+                noise_pred, t, depth_latent_output, generator=generator
+            ).prev_sample
 
-        # If the image has 3 channels, move the channels to the last dimension
-        if image_np.ndim == 3 and image_np.shape[0] == 3:
-            image_np = np.transpose(image_np, (1, 2, 0))
+        depth = self.decode_depth(depth_latent_output)
 
-        # Plot and save the original image
-        plt.figure()
-        plt.imshow(image_np, cmap='gray' if image_np.ndim == 2 else None)
-        plt.title(f"{name.capitalize()} Input")
-        plt.axis('off')
-        plt.savefig(os.path.join(plot_dir, f"{name}_input.png"))
-        plt.close()
 
-        # Plot and save the encoding
-        plt.figure()
-        plt.imshow(encoding_np[0], cmap='viridis')  # Plot the first channel of encoding
-        plt.title(f"{name.capitalize()} Encoding")
-        plt.axis('off')
-        plt.savefig(os.path.join(plot_dir, f"{name}_encoding.png"))
-        plt.close()
+        #print some info    
+        print(f"Depth min: {depth.min()}, Depth max: {depth.max()}")
+        print(f"Depth Shape: {depth.shape}")
 
+
+        # clip prediction
+        depth = torch.clip(depth, -1.0, 1.0)
+        # shift to [0, 1]
+        depth = (depth + 1.0) / 2.0
+        print(f"Depth min: {depth.min()}, Depth max: {depth.max()}")
+        print(f"Depth Shape: {depth.shape}")
+
+        return depth
 
         
 
@@ -553,23 +613,6 @@ class MarigoldPipeline(DiffusionPipeline):
         # scale latent
         rgb_latent = mean * self.rgb_latent_scale_factor
         return rgb_latent
-    
-    def encode_depth(self, depth_in):
-        # stack depth into 3-channel
-        stacked = self.stack_depth_images(depth_in)
-        # encode using VAE encoder
-        depth_latent = self.encode_rgb(stacked)
-        return depth_latent
-
-    @staticmethod
-    def stack_depth_images(depth_in):
-        logging.info(depth_in.shape)
-        if 4 == len(depth_in.shape):
-            stacked = depth_in.repeat(1, 3, 1, 1)
-        elif 3 == len(depth_in.shape):
-            stacked = depth_in.unsqueeze(1)
-            stacked = depth_in.repeat(1, 3, 1, 1)
-        return stacked
 
     def decode_depth(self, depth_latent: torch.Tensor) -> torch.Tensor:
         """

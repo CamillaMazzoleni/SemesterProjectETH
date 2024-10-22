@@ -30,7 +30,7 @@ from .kitti_dataset import KITTIDataset
 from .nyu_dataset import NYUDataset
 from .scannet_dataset import ScanNetDataset
 from .vkitti_dataset import VirtualKITTIDataset
-from .shapenet_dataset import ShapeNetDataset
+from .shapenet_dataset_copy import ShapeNetDataset
 
 
 dataset_name_class_dict = {
@@ -62,12 +62,14 @@ def get_dataset(
         
         if dataset_class == ShapeNetDataset:
             # Special handling for ShapeNetDataset
+            print(base_data_dir)
             dataset = dataset_class(
+                mode= mode,
+                disp_name= "shapenet",
                 json_path=os.path.join(base_data_dir, cfg_data_split.json_filename),
-                image_base_dir=os.path.join(base_data_dir, cfg_data_split.dir),
-                transform=kwargs.get('transform'),
-                depth_transform=kwargs.get('depth_transform'),
-                resize_to_hw=cfg_data_split.get('resize_to_hw', None)
+                image_base_dir=base_data_dir,
+                resize_to_hw=cfg_data_split.get('resize_to_hw', None),
+                **kwargs,
             )
         else:
             # Generic dataset handling
@@ -82,4 +84,6 @@ def get_dataset(
         raise NotImplementedError(f"Dataset {cfg_data_split.name} is not implemented.")
 
     return dataset
+
+
 

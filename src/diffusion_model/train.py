@@ -103,9 +103,6 @@ if "__main__" == __name__:
         help="Add datetime to the output folder name",
     )
 
-    
-
-
     args = parser.parse_args()
     resume_run = args.resume_run
     output_dir = args.output_dir
@@ -205,14 +202,12 @@ if "__main__" == __name__:
             OmegaConf.save(config=cfg, f=f)
         logging.info(f"Config saved to {_output_path}")
         # Copy and tar code on the first run
-        _temp_code_dir = os.path.join(out_dir_run, "code_tar")
-        _code_snapshot_path = os.path.join(out_dir_run, "code_snapshot.tar")
-        os.system(
-            f"rsync --relative -arhvz --quiet --filter=':- .gitignore' --exclude '.git' . '{_temp_code_dir}'"
-        )
-        os.system(f"tar -cf {_code_snapshot_path} {_temp_code_dir}")
-        os.system(f"rm -rf {_temp_code_dir}")
-        logging.info(f"Code snapshot saved to: {_code_snapshot_path}")
+        #_temp_code_dir = os.path.join(out_dir_run, "code_tar")
+        #_code_snapshot_path = os.path.join(out_dir_run, "code_snapshot.tar")
+        #os.system(f"rsync --relative -arhvz --quiet --filter=':- .gitignore' --exclude '.git' . '{_temp_code_dir}'")
+        #os.system(f"tar -cf {_code_snapshot_path} {_temp_code_dir}")
+        #os.system(f"rm -rf {_temp_code_dir}")
+        #logging.info(f"Code snapshot saved to: {_code_snapshot_path}")
 
     # -------------------- Copy data to local scratch (Slurm) --------------------
     if is_on_slurm() and (not args.do_not_copy_data):
@@ -327,6 +322,7 @@ if "__main__" == __name__:
             num_workers=cfg.dataloader.num_workers,
         )
         vis_loaders.append(_vis_loader)
+    print(f"vis loaders {_vis_loader}")
 
     # -------------------- Model --------------------
     _pipeline_kwargs = cfg.pipeline.kwargs if cfg.pipeline.kwargs is not None else {}

@@ -257,7 +257,7 @@ if "__main__" == __name__:
 
             # Read input images
             input_rgb_image = Image.open(rgb_path)
-            input_depth_image = Image.open(depth_path)
+            input_depth_image = Image.open(depth_path).convert("L")
 
             # Random number generator
             if seed is None:
@@ -293,11 +293,20 @@ if "__main__" == __name__:
             np.save(npy_save_path, depth_pred)
 
             # Save as 16-bit uint png
-            depth_to_save = (depth_pred * 65535.0).astype(np.uint16)
-            png_save_path = os.path.join(output_dir_tif, f"{pred_name_base}.png")
-            if os.path.exists(png_save_path):
-                logging.warning(f"Existing file: '{png_save_path}' will be overwritten")
-            Image.fromarray(depth_to_save).save(png_save_path, mode="I;16")
+            # Save as 16-bit uint png
+            depth_to_save_16bit = (depth_pred * 65535.0).astype(np.uint16)
+            png_save_path_16bit = os.path.join(output_dir_tif, f"{pred_name_base}_16bit.png")
+            if os.path.exists(png_save_path_16bit):
+                logging.warning(f"Existing file: '{png_save_path_16bit}' will be overwritten")
+            Image.fromarray(depth_to_save_16bit).save(png_save_path_16bit, mode="I;16")  # "I;16" is for 16-bit images
+
+            # Save as 8-bit uint png
+            depth_to_save_8bit = (depth_pred * 255.0).astype(np.uint8)
+            png_save_path_8bit = os.path.join(output_dir_tif, f"{pred_name_base}_8bit.png")
+            if os.path.exists(png_save_path_8bit):
+                logging.warning(f"Existing file: '{png_save_path_8bit}' will be overwritten")
+            Image.fromarray(depth_to_save_8bit).save(png_save_path_8bit, mode="L")  # "L" is for 8-bit grayscale
+
 
             # Colorize
             colored_save_path = os.path.join(

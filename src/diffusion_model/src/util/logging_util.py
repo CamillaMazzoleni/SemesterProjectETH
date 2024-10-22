@@ -67,6 +67,11 @@ tb_logger = MyTrainingLogger()
 # -------------- wandb tools --------------
 def init_wandb(enable: bool, **kwargs):
     if enable:
+        settings=wandb.Settings(
+            start_method="fork",
+            init_timeout=600,
+            _service_wait=600,
+        ),
         run = wandb.init(sync_tensorboard=True, **kwargs)
     else:
         run = wandb.init(mode="disabled")
