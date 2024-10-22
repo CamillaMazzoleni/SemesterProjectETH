@@ -70,6 +70,32 @@ class Open3DVisualizer(BaseVisualizer):
         
 
         return mesh_sq, vertices
+    
+    def capture_front_depth(self, output_filename: str, distance: float = 1.0, depth_scale: float = 1000.0):
+        """
+        Captures and saves a screenshot of the scene from the front view.
+
+        Parameters:
+        - output_filename: The path where the image will be saved.
+        - distance: The distance of the camera from the center of the scene.
+        """
+        ctr = self.vis.get_view_control()
+
+        # Set the front view
+        ctr.set_front([0, 0, -1])  # Camera looking towards the negative z-axis
+        ctr.set_lookat([0, 0, 0])  # Center of the scene
+        ctr.set_up([0, 1, 0])      # The up direction is along the y-axis
+
+        # Poll events and update the renderer
+        self.vis.poll_events()
+        self.vis.update_renderer()
+
+        try:
+            # Capture and save the screenshot
+            self.vis.capture_depth_image(output_filename, do_render=True, depth_scale=depth_scale)
+            print(f"Front view screenshot saved as {output_filename}")
+        except Exception as e:
+            print(f"Failed to save front view screenshot: {e}")
 
 
     def capture_front_picture(self, output_filename: str):
@@ -96,6 +122,10 @@ class Open3DVisualizer(BaseVisualizer):
             print(f"Front view screenshot saved as {output_filename}")
         except Exception as e:
             print(f"Failed to save front view screenshot: {e}")
+            
+
+    
+
     
 
     def add_complete_cuboid(self, cuboid_data):
@@ -242,6 +272,42 @@ class Open3DVisualizer(BaseVisualizer):
         }
 
         return self.save_views(base_filename, views, colors, output_folder_path, save_depth=save_depth)
+    
+    def capture_single_view(self, view_direction, depth_o3d_filename, output_filename, save_depth=False, distance=1.0):
+        ctr = self.vis.get_view_control()
+        ctr.set_front(view_direction)
+        ctr.set_lookat([0, 0, 0])
+        ctr.set_up([0, 1, 0])  # Assuming front view with y-axis up
+        
+        # Apply camera extrinsic (optional)
+        camera_params = ctr.convert_to_pinhole_camera_parameters()
+        extrinsic_front = np.array([
+            [1, 0, 0, 0],    # No rotation around X
+            [0, 1, 0, 0],    # No rotation around Y
+            [0, 0, 1, distance],  # Camera positioned at Z = distance
+            [0, 0, 0, 1]
+        ])
+        camera_params.extrinsic = extrinsic_front
+        ctr.convert_from_pinhole_camera_parameters(camera_params, allow_arbitrary=True)
+        ctr.set_up([0, 1, 0])
+        self.vis.poll_events()
+        self.vis.update_renderer()
+
+        # Save either a depth image or regular screenshot
+        if save_depth:
+            # Save depth image
+            self.vis.capture_depth_image(depth_o3d_filename)
+            depth_image = o3d.io.read_image(depth_o3d_filename)
+            depth_array = np.asarray(depth_image)
+
+            # Normalize the depth values for visualization purposes
+            depth_normalized_image = Image.fromarray((depth_array * 255).astype(np.uint8))
+            depth_normalized_image.save(output_filename)
+            print(f"Saved depth image to {output_filename}")
+        else:
+            # Save regular screenshot
+            self.vis.capture_screen_image(output_filename)
+            print(f"Saved screenshot to {output_filename}")
     
 
     def add_geometry(self, mesh):
